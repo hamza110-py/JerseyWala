@@ -59,6 +59,7 @@ create table if not exists public.products (
   sale_price numeric(10,2) check (sale_price is null or (sale_price >= 0 and sale_price < price)),
   sizes text[] not null default '{}',
   stock integer not null default 0 check (stock >= 0),
+  size_stock jsonb not null default '{}'::jsonb,       -- stock per size, e.g. {"M": 5, "L": 0}
   is_sold_out boolean not null default false,
   is_featured boolean not null default false,
   is_new_arrival boolean not null default false,
@@ -73,6 +74,7 @@ create table if not exists public.products (
 -- for projects created with the earlier version:
 alter table public.products add column if not exists country text not null default '';
 alter table public.products add column if not exists is_retro boolean not null default false;
+alter table public.products add column if not exists size_stock jsonb not null default '{}'::jsonb;
 
 create index if not exists products_created_at_idx on public.products (created_at desc);
 create index if not exists products_club_idx on public.products (club);
@@ -274,6 +276,8 @@ declare
   item jsonb;
   prod public.products;
   qty integer;
+  sz text;
+  size_qty integer;
   unit numeric;
   new_id uuid;
   num bigint;
@@ -303,8 +307,25 @@ begin
       raise exception 'Sold out: %', prod.name;
     end if;
 
+    sz := upper(left(coalesce(item->>'size', ''), 10));
+
+    -- the size must be one the admin selected for this product
+    if coalesce(array_length(prod.sizes, 1), 0) > 0 and not (sz = any(prod.sizes)) then
+      raise exception 'Size % is not available for %', sz, prod.name;
+    end if;
+
+    -- stock for this size (falls back to the total for older products)
+    if (prod.size_stock ->> sz) is not null then
+      size_qty := (prod.size_stock ->> sz)::integer;
+    else
+      size_qty := prod.stock;
+    end if;
+    if size_qty <= 0 then
+      raise exception 'Sold out: % (size %)', prod.name, sz;
+    end if;
+
     qty := (item->>'quantity')::integer;
-    if qty is null or qty < 1 or qty > least(prod.stock, 10) then
+    if qty is null or qty < 1 or qty > least(size_qty, 10) then
       raise exception 'Invalid quantity for %', prod.name;
     end if;
 
@@ -312,7 +333,7 @@ begin
                  then prod.sale_price else prod.price end;
 
     insert into public.order_items (order_id, product_id, product_name, size, quantity, unit_price)
-    values (new_id, prod.id, prod.name, left(coalesce(item->>'size', ''), 10), qty, unit);
+    values (new_id, prod.id, prod.name, sz, qty, unit);
 
     running := running + unit * qty;
   end loop;
@@ -341,21 +362,35 @@ declare
 begin
   if old.status in ('pending', 'cancelled') and new.status in ('confirmed', 'shipped', 'delivered') then
     for r in
-      select product_id, sum(quantity)::integer as q
+      select product_id, size, sum(quantity)::integer as q
       from public.order_items
       where order_id = new.id and product_id is not null
-      group by product_id
+      group by product_id, size
     loop
-      update public.products set stock = greatest(stock - r.q, 0) where id = r.product_id;
+      update public.products
+      set stock = greatest(stock - r.q, 0),
+          size_stock = case
+            when (size_stock ->> r.size) is not null
+            then jsonb_set(size_stock, array[r.size], to_jsonb(greatest((size_stock ->> r.size)::integer - r.q, 0)))
+            else size_stock
+          end
+      where id = r.product_id;
     end loop;
   elsif old.status in ('confirmed', 'shipped', 'delivered') and new.status in ('pending', 'cancelled') then
     for r in
-      select product_id, sum(quantity)::integer as q
+      select product_id, size, sum(quantity)::integer as q
       from public.order_items
       where order_id = new.id and product_id is not null
-      group by product_id
+      group by product_id, size
     loop
-      update public.products set stock = stock + r.q where id = r.product_id;
+      update public.products
+      set stock = stock + r.q,
+          size_stock = case
+            when (size_stock ->> r.size) is not null
+            then jsonb_set(size_stock, array[r.size], to_jsonb((size_stock ->> r.size)::integer + r.q))
+            else size_stock
+          end
+      where id = r.product_id;
     end loop;
   end if;
   return new;
