@@ -5,8 +5,8 @@ import AddToCart from '@/components/AddToCart';
 import ProductCard from '@/components/ProductCard';
 import { getProductBySlug, listProducts } from '@/lib/products';
 import { getSettings } from '@/lib/settings';
+import { getSizeOptions } from '@/lib/sizes';
 import {
-  SIZES,
   discountPercent,
   effectivePrice,
   formatPKR,
@@ -40,8 +40,12 @@ export default async function ProductPage({ params }) {
   const available = isAvailable(product);
   const sale = hasDiscount(product);
   const price = effectivePrice(product);
-  const stock = Number(product.stock) || 0;
-  const sizes = SIZES.filter((s) => (product.sizes || []).includes(s));
+  // Only the sizes the admin selected, each with its own stock (see lib/sizes.js).
+  const sizeOptions = getSizeOptions(product);
+  const sizes = sizeOptions.map((o) => o.size);
+  const stock = sizeOptions.length > 0
+    ? sizeOptions.reduce((sum, o) => sum + (o.available ? o.stock : 0), 0)
+    : Number(product.stock) || 0;
   const specs = parseSpecs(product.specifications);
 
   let stockLabel = 'In stock';
@@ -97,7 +101,7 @@ export default async function ProductPage({ params }) {
               name: product.name,
               image: product.images?.[0] || '',
               price,
-              sizes,
+              sizeOptions,
               stock,
               available,
             }}
