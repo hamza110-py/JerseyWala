@@ -4,7 +4,8 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
 import { prepareImage } from '@/lib/image';
-import { SIZES, slugify, storagePathFromUrl } from '@/lib/utils';
+import { slugify, storagePathFromUrl } from '@/lib/utils';
+import { SIZES, normalizeSizeStock, normalizeSizes, splitStock, sumStock } from '@/lib/sizes';
 import Toggle from '@/components/admin/Toggle';
 
 const EMPTY = {
@@ -17,7 +18,7 @@ const EMPTY = {
   price: '',
   sale_price: '',
   sizes: [...SIZES],
-  stock: '10',
+  sizeStock: { S: '2', M: '2', L: '2', XL: '2', XXL: '2' }, // stock for each size
   is_sold_out: false,
   is_featured: false,
   is_new_arrival: true,
@@ -25,6 +26,13 @@ const EMPTY = {
   is_retro: false,
   is_published: true,
 };
+
+function friendlyDbError(message) {
+  if (/size_stock/i.test(message || '')) {
+    return 'The database needs a one-time update for per-size stock. In Supabase open SQL Editor and run the file supabase/migrate_size_stock.sql, then save again.';
+  }
+  return message;
+}
 
 function Section({ number, title, children }) {
   return (
@@ -76,6 +84,14 @@ export default function ProductForm({ productId }) {
           setLoading(false);
           return;
         }
+        const loadedSizes = normalizeSizes(data.sizes);
+        const ownStock = normalizeSizeStock(data.size_stock, loadedSizes);
+        // Older products only have one total number: spread it over the selected sizes.
+        const stockPerSize = Object.keys(ownStock).length > 0 ? ownStock : splitStock(data.stock, loadedSizes);
+        const sizeStockText = {};
+        loadedSizes.forEach((s) => {
+          sizeStockText[s] = String(stockPerSize[s] ?? 0);
+        });
         setForm({
           name: data.name || '',
           description: data.description || '',
@@ -85,8 +101,8 @@ export default function ProductForm({ productId }) {
           category_id: data.category_id || '',
           price: String(data.price ?? ''),
           sale_price: data.sale_price != null ? String(data.sale_price) : '',
-          sizes: data.sizes || [],
-          stock: String(data.stock ?? 0),
+          sizes: loadedSizes,
+          sizeStock: sizeStockText,
           is_sold_out: !!data.is_sold_out,
           is_featured: !!data.is_featured,
           is_new_arrival: !!data.is_new_arrival,
@@ -140,10 +156,18 @@ export default function ProductForm({ productId }) {
   }
 
   function toggleSize(size) {
-    setForm((f) => ({
-      ...f,
-      sizes: f.sizes.includes(size) ? f.sizes.filter((s) => s !== size) : [...f.sizes, size],
-    }));
+    setForm((f) => {
+      const selected = f.sizes.includes(size);
+      const nextSizes = normalizeSizes(selected ? f.sizes.filter((s) => s !== size) : [...f.sizes, size]);
+      const nextStock = { ...f.sizeStock };
+      // a newly selected size starts with 1 in stock (change it below)
+      if (!selected && (nextStock[size] === undefined || nextStock[size] === '')) nextStock[size] = '1';
+      return { ...f, sizes: nextSizes, sizeStock: nextStock };
+    });
+  }
+
+  function setSizeStock(size, value) {
+    setForm((f) => ({ ...f, sizeStock: { ...f.sizeStock, [size]: value } }));
   }
 
   function fail(message) {
@@ -171,13 +195,20 @@ export default function ProductForm({ productId }) {
 
     if (form.sizes.length === 0) return fail('Please select at least one available size.');
 
-    const stock = parseInt(form.stock, 10);
-    if (Number.isNaN(stock) || stock < 0) return fail('Please enter a stock quantity (0 or more).');
+    const selectedSizes = normalizeSizes(form.sizes);
+    const sizeStock = {};
+    for (const s of selectedSizes) {
+      const n = parseInt(form.sizeStock[s], 10);
+      if (Number.isNaN(n) || n < 0) return fail(`Please enter the stock for size ${s} (0 or more).`);
+      sizeStock[s] = n;
+    }
+    const stock = sumStock(sizeStock, selectedSizes);
 
     setSaving(true);
     const supabase = createClient();
     const id = productId || crypto.randomUUID();
     const uploadedPaths = [];
+    let dbSaved = false;
 
     try {
       // 1) Upload any new photos
@@ -207,8 +238,9 @@ export default function ProductForm({ productId }) {
         category_id: form.category_id || null,
         price,
         sale_price: sale,
-        sizes: SIZES.filter((s) => form.sizes.includes(s)),
-        stock,
+        sizes: selectedSizes,
+        size_stock: sizeStock,
+        stock, // total of all sizes
         is_sold_out: form.is_sold_out,
         is_featured: form.is_featured,
         is_new_arrival: form.is_new_arrival,
@@ -221,12 +253,32 @@ export default function ProductForm({ productId }) {
       let savedSlug = slug;
       if (isEdit) {
         const { error: updateError } = await supabase.from('products').update(row).eq('id', id);
-        if (updateError) throw new Error(updateError.message);
+        if (updateError) throw new Error(friendlyDbError(updateError.message));
       } else {
         savedSlug = `${slugify(name) || 'jersey'}-${id.slice(0, 6)}`;
         const { error: insertError } = await supabase.from('products').insert({ ...row, id, slug: savedSlug });
-        if (insertError) throw new Error(insertError.message);
+        if (insertError) throw new Error(friendlyDbError(insertError.message));
       }
+
+      dbSaved = true;
+
+      // Read the product back from the database and compare. This proves what the
+      // website will show is exactly what you selected.
+      const { data: stored, error: readError } = await supabase
+        .from('products')
+        .select('sizes, size_stock, stock')
+        .eq('id', id)
+        .maybeSingle();
+      if (readError || !stored) {
+        throw new Error('Saved, but could not read the product back to verify it. Please open the product and check the sizes.');
+      }
+      const storedSizes = normalizeSizes(stored.sizes);
+      if (storedSizes.join(',') !== selectedSizes.join(',')) {
+        throw new Error(
+          `Sizes did not save correctly (you chose ${selectedSizes.join(', ')} but the database has ${storedSizes.join(', ') || 'none'}). Please try saving again.`
+        );
+      }
+      const storedSizeStock = normalizeSizeStock(stored.size_stock, storedSizes);
 
       // 3) Delete photos that were removed
       const removedPaths = originalUrls
@@ -242,10 +294,15 @@ export default function ProductForm({ productId }) {
       setItems(finalUrls.map((url, i) => ({ key: `old-${i}-${url}`, url, preview: url })));
       setOriginalUrls(finalUrls);
       setSlug(savedSlug);
-      setDone({ slug: savedSlug, mode: isEdit ? 'updated' : 'published' });
+      setDone({
+        slug: savedSlug,
+        mode: isEdit ? 'updated' : 'published',
+        sizes: storedSizes.map((s) => ({ size: s, stock: storedSizeStock[s] ?? 0 })),
+      });
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
-      if (uploadedPaths.length > 0) {
+      // only clean up new photos if the product itself was NOT saved
+      if (!dbSaved && uploadedPaths.length > 0) {
         await supabase.storage.from('product-images').remove(uploadedPaths);
       }
       fail(err.message || 'Something went wrong. Please try again.');
@@ -277,6 +334,14 @@ export default function ProductForm({ productId }) {
             ? 'The website has been updated. Visitors can see it right now.'
             : 'This product is hidden, so visitors cannot see it yet.'}
         </p>
+        {done.sizes && done.sizes.length > 0 && (
+          <div className="mx-auto mt-4 max-w-sm rounded-lg border border-line bg-charcoal px-4 py-3 text-left text-sm">
+            <p className="text-xs font-semibold uppercase tracking-wider text-white/50">Sizes saved (checked in the database)</p>
+            <p className="mt-1">
+              {done.sizes.map((x) => `${x.size} (${x.stock})`).join(' · ')}
+            </p>
+          </div>
+        )}
         <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:justify-center">
           {form.is_published && (
             <Link href={`/product/${done.slug}`} target="_blank" className="btn-red">
@@ -511,18 +576,38 @@ export default function ProductForm({ productId }) {
             </button>
           ))}
         </div>
-        <div className="mt-5 max-w-xs">
-          <label htmlFor="stock" className="label">Stock Quantity</label>
-          <input
-            id="stock"
-            type="number"
-            inputMode="numeric"
-            min="0"
-            className="input"
-            value={form.stock}
-            onChange={(e) => set('stock', e.target.value)}
-          />
-          <p className="mt-1 text-xs text-white/40">When stock is 0 the jersey shows as “Sold out” automatically.</p>
+        <div className="mt-5">
+          <p className="label">Stock for each size</p>
+          {form.sizes.length === 0 ? (
+            <p className="text-sm text-white/40">Select a size above to set its stock.</p>
+          ) : (
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+              {form.sizes.map((s) => (
+                <div key={s}>
+                  <label htmlFor={`stock-${s}`} className="mb-1 block text-xs font-semibold text-white/70">
+                    {s}
+                  </label>
+                  <input
+                    id={`stock-${s}`}
+                    type="number"
+                    inputMode="numeric"
+                    min="0"
+                    className="input"
+                    value={form.sizeStock[s] ?? ''}
+                    onChange={(e) => setSizeStock(s, e.target.value)}
+                    aria-label={`Stock for size ${s}`}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="mt-2 text-xs text-white/40">
+            Total stock: {sumStock(
+              Object.fromEntries(form.sizes.map((s) => [s, form.sizeStock[s]])),
+              form.sizes
+            )}
+            . A size with 0 shows as “Sold out” on the website. Sizes you don’t select are not shown at all.
+          </p>
         </div>
         <div className="mt-5">
           <Toggle

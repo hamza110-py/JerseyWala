@@ -5,10 +5,11 @@ import Link from 'next/link';
 import { Check, Instagram, ShoppingBag } from 'lucide-react';
 import { useCart } from '@/components/CartProvider';
 
+// sizeOptions: [{ size: 'M', stock: 5, available: true }, ...]
+// It contains ONLY the sizes the admin selected, already worked out on the server.
 export default function AddToCart({ product, instagramProfile }) {
-  const { id, slug, name, image, price, sizes, stock, available } = product;
-  const sizeList = sizes && sizes.length > 0 ? sizes : [];
-  const maxQty = Math.max(1, Math.min(Number(stock) || 1, 10));
+  const { id, slug, name, image, price, sizeOptions = [], stock, available } = product;
+  const hasSizes = sizeOptions.length > 0;
   const { addItem } = useCart();
 
   const [size, setSize] = useState('');
@@ -16,47 +17,81 @@ export default function AddToCart({ product, instagramProfile }) {
   const [error, setError] = useState('');
   const [added, setAdded] = useState(false);
 
+  const selected = sizeOptions.find((o) => o.size === size);
+  // how many the customer may order: the chosen size's stock (or the total if no sizes)
+  const limit = selected ? selected.stock : Number(stock) || 0;
+  const maxQty = Math.max(1, Math.min(limit || 1, 10));
+  const anySoldOut = sizeOptions.some((o) => !o.available);
+
+  function chooseSize(option) {
+    if (!option.available) return;
+    setSize(option.size);
+    setQuantity((q) => Math.min(q, Math.max(1, Math.min(option.stock, 10))));
+    setError('');
+    setAdded(false);
+  }
+
   function handleAdd() {
     if (!available) return;
-    if (sizeList.length > 0 && !size) {
+    if (hasSizes && !selected) {
       setError('Please select a size first.');
       return;
     }
+    if (selected && !selected.available) {
+      setError('That size is sold out. Please choose another size.');
+      return;
+    }
     setError('');
-    addItem({ id, slug, name, image, price, size: size || 'Standard', quantity, maxQty });
+    addItem({
+      id,
+      slug,
+      name,
+      image,
+      price,
+      size: selected ? selected.size : 'Standard',
+      quantity: Math.min(quantity, maxQty),
+      maxQty,
+    });
     setAdded(true);
   }
 
   return (
     <div>
-      {sizeList.length > 0 && (
+      {hasSizes && (
         <div>
           <div className="mb-2 flex items-center justify-between">
             <p className="text-sm font-semibold uppercase tracking-wider">Size</p>
             {size && <p className="text-sm text-white/60">Selected: {size}</p>}
           </div>
           <div className="flex flex-wrap gap-2">
-            {sizeList.map((s) => (
-              <button
-                key={s}
-                type="button"
-                disabled={!available}
-                aria-pressed={size === s}
-                onClick={() => {
-                  setSize(s);
-                  setError('');
-                  setAdded(false);
-                }}
-                className={`h-11 min-w-[3.25rem] rounded-lg border px-4 text-sm font-semibold transition disabled:opacity-40 ${
-                  size === s
-                    ? 'border-brand bg-brand text-white'
-                    : 'border-line bg-panel text-white/80 hover:border-white/50'
-                }`}
-              >
-                {s}
-              </button>
-            ))}
+            {sizeOptions.map((o) => {
+              const isSelected = size === o.size;
+              return (
+                <button
+                  key={o.size}
+                  type="button"
+                  disabled={!o.available}
+                  aria-pressed={isSelected}
+                  aria-label={o.available ? `Size ${o.size}` : `Size ${o.size}, sold out`}
+                  title={o.available ? `Size ${o.size}` : `Size ${o.size} is sold out`}
+                  onClick={() => chooseSize(o)}
+                  className={`h-11 min-w-[3.25rem] rounded-lg border px-4 text-sm font-semibold transition ${
+                    !o.available
+                      ? 'cursor-not-allowed border-line bg-panel text-white/30 line-through opacity-50'
+                      : isSelected
+                      ? 'border-brand bg-brand text-white'
+                      : 'border-line bg-panel text-white/80 hover:border-white/50'
+                  }`}
+                >
+                  {o.size}
+                </button>
+              );
+            })}
           </div>
+          {anySoldOut && <p className="mt-2 text-xs text-white/40">Crossed-out sizes are sold out.</p>}
+          {selected && selected.stock <= 5 && (
+            <p className="mt-2 text-xs font-semibold text-amber-400">Only {selected.stock} left in size {selected.size}</p>
+          )}
         </div>
       )}
 
